@@ -1,0 +1,19 @@
+logs/
+data/
+state/
+release/
+*.exe
+*.log
+*.app/
+
+# 本地验证产物和临时工作文件
+/work/
+*.zip
+*.pid
+
+# 本地凭据文件
+.env
+.env.*
+!.env.example
+*.pem
+*.key

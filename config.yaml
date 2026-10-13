@@ -1,0 +1,40 @@
+# 本地路由器配置示例；目标域名仅精确匹配，*.域名仅匹配其子域名。
+server:
+  host: 127.0.0.1
+  port: 17890
+
+upstream:
+  # auto 会由程序探测代理协议；也可明确指定 http 或 socks5。
+  type: auto
+  # 占位示例。请替换为手机通过 USB 网络共享开放给电脑的代理地址和端口，
+  # 这里填写的是手机软件向局域网开放的代理入口，并非手机内部远端节点地址。
+  host: 127.0.0.1
+  port: 1080
+  name: 手机代理
+  username: ""
+  # 密码可直接填写，或使用 ${环境变量名} 引用环境变量。
+  password: ""
+
+targets:
+  - openai.com
+  - "*.openai.com"
+  - chatgpt.com
+  - "*.chatgpt.com"
+  - oaistatic.com
+  - "*.oaistatic.com"
+  - oaiusercontent.com
+  - "*.oaiusercontent.com"
+
+log:
+  level: info
+  file: logs/codex-router.log
+
+health:
+  url: https://api.openai.com/
+  interval_seconds: 30
+  timeout_seconds: 10
+  state_file: data/health.json
+
+launcher:
+  executable: ""
+  args: []
