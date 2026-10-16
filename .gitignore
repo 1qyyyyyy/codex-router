@@ -17,3 +17,7 @@ release/
 !.env.example
 *.pem
 *.key
+
+# 临时目录和生成文件
+/tmp/
+/output/

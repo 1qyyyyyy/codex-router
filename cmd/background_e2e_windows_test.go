@@ -24,6 +24,7 @@ import (
 
 	"codex-router/config"
 	"codex-router/integration"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"gopkg.in/yaml.v3"
 )
@@ -105,19 +106,12 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"CodexRouter.exe", "启动代理.cmd", "检测出口.cmd", "结束代理.cmd"} {
-		data, err := os.ReadFile(filepath.Join(filepath.Dir(executable), name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.HasSuffix(name, ".cmd") {
-			if strings.HasPrefix(string(data), "\xef\xbb\xbf") || strings.Contains(strings.ReplaceAll(string(data), "\r\n", ""), "\n") {
-				t.Fatal("批处理编码或换行不符合发布要求")
-			}
-		}
-		if err := os.WriteFile(filepath.Join(directory, name), data, 0600); err != nil {
-			t.Fatal(err)
-		}
+	data, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "CodexRouter.exe"), data, 0600); err != nil {
+		t.Fatal(err)
 	}
 	executable = filepath.Join(directory, "CodexRouter.exe")
 	cfg := config.Default()
@@ -133,12 +127,13 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 	cfg.Health.URL = "http://chatgpt.com/路由验证"
 	cfg.Health.TimeoutSeconds = 3
 	path := filepath.Join(directory, "config.yaml")
-	data, _ := yaml.Marshal(cfg)
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	configData, _ := yaml.Marshal(cfg)
+	if err := os.WriteFile(path, configData, 0600); err != nil {
 		t.Fatal(err)
 	}
 	run := func(action string) ([]byte, error) {
 		command := exec.Command(executable, action, "--config", path)
+		command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
 		return command.CombinedOutput()
 	}
 	t.Cleanup(func() {
@@ -147,14 +142,7 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 			t.Errorf("清理后台失败：%s，%v", output, err)
 		}
 	})
-	batch := func(name string) *exec.Cmd {
-		command := exec.Command("cmd.exe")
-		command.SysProcAttr = &syscall.SysProcAttr{CmdLine: `cmd.exe /d /s /c ""` + filepath.Join(directory, name) + `""`, HideWindow: true}
-		command.Stdin = strings.NewReader("\r\n")
-		return command
-	}
-	parent := batch("启动代理.cmd")
-	output, err := parent.CombinedOutput()
+	output, err := run("start")
 	if err != nil {
 		t.Fatalf("后台启动失败：%s，%v", output, err)
 	}
@@ -241,10 +229,10 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 	if output, err := run("health"); err != nil || !strings.Contains(string(output), "本地入口") {
 		t.Fatalf("双层检测失败：%s，%v", output, err)
 	}
-	if output, err := batch("检测出口.cmd").CombinedOutput(); err != nil {
-		t.Fatalf("检测批处理失败：%s，%v", output, err)
+	if output, err := run("diagnose"); err != nil || !strings.Contains(string(output), "系统代理：通过") {
+		t.Fatalf("诊断失败：%s，%v", output, err)
 	}
-	if output, err := batch("结束代理.cmd").CombinedOutput(); err != nil {
+	if output, err := run("stop"); err != nil {
 		t.Fatalf("结束失败：%s，%v", output, err)
 	}
 	if strings.Contains(desktopStatus(path), "上游健康：健康") {
@@ -297,5 +285,5 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 	if after := currentProxyRegistry(t); !reflect.DeepEqual(before, after) {
 		t.Fatal("不可用上游改变了系统设置")
 	}
-	t.Log("三个真实批处理、中文带空格目录、父命令结束后转发、重复启动、双层检测、停止释放端口及崩溃恢复均通过")
+	t.Log("直接调用可执行文件、中文带空格目录、父命令结束后转发、重复启动、双层检测、停止释放端口及崩溃恢复均通过")
 }

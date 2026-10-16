@@ -134,6 +134,93 @@ func WriteDefault(path string) error {
 	return nil
 }
 
+// UpdateUpstream 只更新配置中的上游主机和端口，保留其余字段及注释。
+// 写入采用临时文件替换，避免面板保存过程中留下半份配置。
+func UpdateUpstream(path, host string, port int) error {
+	host = strings.TrimSpace(host)
+	if !validHost(host) {
+		return fmt.Errorf("上游主机名或 IP 地址无效")
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("上游端口必须在 1 到 65535 之间")
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if port == cfg.Server.Port && sameHost(host, cfg.Server.Host) {
+		return fmt.Errorf("上游地址不能与本地监听地址相同")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败：%w", err)
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("解析配置文件失败：%w", err)
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("配置文件根节点必须是对象")
+	}
+	rootMap := root.Content[0]
+	var upstream *yaml.Node
+	for i := 0; i+1 < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "upstream" {
+			upstream = rootMap.Content[i+1]
+			break
+		}
+	}
+	if upstream == nil || upstream.Kind != yaml.MappingNode {
+		return fmt.Errorf("配置缺少 upstream 节点")
+	}
+	set := func(key, value string) {
+		for i := 0; i+1 < len(upstream.Content); i += 2 {
+			if upstream.Content[i].Value == key {
+				upstream.Content[i+1].Value = value
+				upstream.Content[i+1].Tag = "!!str"
+				return
+			}
+		}
+		upstream.Content = append(upstream.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value})
+	}
+	set("host", host)
+	set("port", fmt.Sprint(port))
+	// 端口必须按数字写入，避免严格解析时被识别为字符串。
+	for i := 0; i+1 < len(upstream.Content); i += 2 {
+		if upstream.Content[i].Value == "port" {
+			upstream.Content[i+1].Tag = "!!int"
+		}
+	}
+	updated, err := yaml.Marshal(&root)
+	if err != nil {
+		return fmt.Errorf("生成配置文件失败：%w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".codex-router-config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("创建配置临时文件失败：%w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("设置配置文件权限失败：%w", err)
+	}
+	if _, err = tmp.Write(updated); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("写入配置文件失败：%w", err)
+	}
+	closeErr := tmp.Close()
+	if closeErr != nil {
+		return fmt.Errorf("关闭配置临时文件失败：%w", closeErr)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("替换配置文件失败：%w", err)
+	}
+	return nil
+}
+
 // Validate 检查配置字段及其取值。
 func (c *Config) Validate() error {
 	if c == nil {

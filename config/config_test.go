@@ -5,7 +5,39 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
+
+func TestUpdateUpstream(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := Default()
+	cfg.Upstream.Name = "测试出口"
+	cfg.Upstream.Type = "socks5"
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateUpstream(path, "192.168.1.20", 7890); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Upstream.Host != "192.168.1.20" || updated.Upstream.Port != 7890 || updated.Upstream.Name != "测试出口" || updated.Upstream.Type != "socks5" {
+		t.Fatalf("上游更新或其他配置保留失败：%+v", updated.Upstream)
+	}
+	if err := UpdateUpstream(path, "bad..host", 7890); err == nil {
+		t.Fatal("非法主机名应被拒绝")
+	}
+	if err := UpdateUpstream(path, "192.168.1.20", 0); err == nil {
+		t.Fatal("非法端口应被拒绝")
+	}
+}
 
 func TestDefaultAndMatchTarget(t *testing.T) {
 	cfg := Default()

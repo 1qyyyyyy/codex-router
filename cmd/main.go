@@ -23,18 +23,25 @@ import (
 	"codex-router/service"
 )
 
-const version = "1.2.1"
+const version = "1.3.0"
 
 func main() {
 	if err := execute(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		if isDesktopInvocation(os.Args[1:]) && showStartupError(err) {
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "错误：", err)
 		os.Exit(1)
 	}
 }
 
+func isDesktopInvocation(args []string) bool {
+	return len(args) == 0 || args[0] == "panel" || args[0] == "tray"
+}
+
 func execute(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return runService("")
+		return runDefault()
 	}
 	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		printHelp(stdout)
@@ -158,7 +165,7 @@ func printHelp(out io.Writer) {
                               启动后台代理、恢复设置并结束代理、检查运行状态
   tray|panel [--config 路径]  打开桌面控制面板
   diagnose [--config 路径]    分步诊断上游、本地入口及系统代理
-  run                         前台运行本地代理服务（默认命令）
+  run                         前台运行本地代理服务
   init [--config 路径]        生成默认配置，不覆盖已有文件
   check --config 路径         校验配置
   health --config 路径        通过上游检测一次并输出 JSON

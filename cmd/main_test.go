@@ -19,6 +19,28 @@ func TestParseLaunchArgsSeparatesApplicationArguments(t *testing.T) {
 	}
 }
 
+func TestIsDesktopInvocation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"无参数启动", nil, true},
+		{"面板命令", []string{"panel", "--config", "router.yaml"}, true},
+		{"托盘命令", []string{"tray"}, true},
+		{"诊断命令", []string{"diagnose"}, false},
+		{"后台命令", []string{"background", "--config", "router.yaml"}, false},
+		{"启动命令", []string{"start", "--config", "router.yaml"}, false},
+		{"停止命令", []string{"stop", "--config", "router.yaml"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isDesktopInvocation(test.args); got != test.want {
+				t.Errorf("是否桌面启动为 %t，预期 %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestParseLaunchRequiresConfigAndDelimiterForAppArgs(t *testing.T) {
 	if _, _, _, err := parseLaunchArgs([]string{"--app", "client.exe"}); err == nil {
 		t.Fatal("launch 应要求配置路径")

@@ -3,11 +3,15 @@
 package main
 
 import (
+	"codex-router/config"
 	"crypto/sha256"
+	"errors"
 	"fmt"
-	"os/exec"
+	"net"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,20 +67,44 @@ type desktopMinMax struct{ Reserved, Maximum, MaximumPosition, MinimumTrack, Max
 type desktopView struct {
 	window, status, output, font           uintptr
 	titleFont, bodyFont                    uintptr
+	labelFont                              uintptr
+	dpi                                    uint32
 	backgroundBrush, panelBrush, editBrush uintptr
 	buttons                                [4]uintptr
+	settingsLabels                         [2]uintptr
+	upstreamHost, upstreamPort             uintptr
+	saveSettings, cancelSettings           uintptr
+	settingsMode                           bool
+	copyOutput, detailButton, copyStatus   uintptr
+	panel                                  desktopPanelState
+	diagnostic                             *desktopDiagnosisReport
+	expanded                               bool
+	outputText                             string
+	savedHost, savedPort                   string
+	settingsLoading, dirty                 bool
+	settingsNotice                         string
+	noticeFailed                           bool
+	settingsError                          uintptr
+	activeAction                           uintptr
+	hovered                                uintptr
+	buttonProc                             uintptr
+	closed                                 bool
 	path                                   string
 	tray                                   desktopNotify
 	restart                                uint32
 	trayReady                              bool
 	busy                                   bool
 	refresh                                bool
+	statusGeneration                       uint64
 	mu                                     sync.Mutex
 	results                                []desktopResult
 }
 type desktopResult struct {
-	status bool
-	text   string
+	status     bool
+	text       string
+	panel      desktopPanelState
+	report     *desktopDiagnosisReport
+	generation uint64
 }
 
 var desktopCurrent *desktopView
@@ -116,56 +144,67 @@ func runDesktop(path string) error {
 		defer windows.CloseHandle(mutex)
 	}
 	if err == windows.ERROR_ALREADY_EXISTS {
-		window := uintptr(0)
 		for attempt := 0; attempt < 40; attempt++ {
-			window = desktopCall("FindWindowW", uintptr(unsafe.Pointer(desktopString(name))), 0)
+			window := desktopCall("FindWindowW", uintptr(unsafe.Pointer(desktopString(name))), 0)
 			if window != 0 {
-				break
+				desktopCall("PostMessageW", window, 0x8003, 0, 0)
+				return nil
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		if window != 0 {
-			desktopCall("PostMessageW", window, 0x8003, 0, 0)
-		}
 		return nil
 	}
-	// 使用系统自动缩放，确保高分辨率下文字和控件保持可读。
+	desktopEnableDPI()
 	instance, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetModuleHandleW").Call(0)
-	class := desktopClass{Size: uint32(unsafe.Sizeof(desktopClass{})), Callback: syscall.NewCallback(desktopWindowProc), Instance: uintptr(instance), Icon: desktopCall("LoadIconW", 0, 32512), Cursor: desktopCall("LoadCursorW", 0, 32512), Background: 6, Name: desktopString(name)}
+	class := desktopClass{Size: uint32(unsafe.Sizeof(desktopClass{})), Callback: syscall.NewCallback(desktopWindowProc), Instance: instance, Icon: desktopCall("LoadIconW", 0, 32512), Cursor: desktopCall("LoadCursorW", 0, 32512), Name: desktopString(name)}
 	if desktopCall("RegisterClassExW", uintptr(unsafe.Pointer(&class))) == 0 {
 		return fmt.Errorf("无法注册原生面板窗口")
 	}
-	defer desktopCall("UnregisterClassW", uintptr(unsafe.Pointer(class.Name)), uintptr(instance))
-	view := &desktopView{path: absolute}
+	defer desktopCall("UnregisterClassW", uintptr(unsafe.Pointer(class.Name)), instance)
+	view := &desktopView{path: absolute, panel: desktopPanelState{Title: "正在读取后台状态", Subtitle: "正在确认本地入口和上游连接……", Entry: "正在读取", Health: "正在读取", Target: "正在读取"}}
 	desktopCurrent = view
 	defer func() { desktopCurrent = nil }()
+	view.backgroundBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(desktopBackground)
+	view.panelBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(desktopSurface)
+	view.editBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(desktopInput)
 	view.restart = uint32(desktopCall("RegisterWindowMessageW", uintptr(unsafe.Pointer(desktopString("TaskbarCreated")))))
-	window := desktopCall("CreateWindowExW", 0, uintptr(unsafe.Pointer(class.Name)), uintptr(unsafe.Pointer(desktopString("路由助手 · 状态面板"))), 0x00CF0000, 0x80000000, 0x80000000, 980, 760, 0, 0, uintptr(instance), 0)
+	window := desktopCall("CreateWindowExW", 0, uintptr(unsafe.Pointer(class.Name)), uintptr(unsafe.Pointer(desktopString("路由助手 · 状态面板"))), 0x02CF0000, 0x80000000, 0x80000000, 980, 760, 0, 0, instance, 0)
 	if window == 0 {
 		return fmt.Errorf("无法创建原生状态面板")
 	}
 	view.window = window
-	view.font, _, _ = desktopGDI.NewProc("CreateFontW").Call(^uintptr(15), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(desktopString("微软雅黑"))))
-	view.titleFont, _, _ = desktopGDI.NewProc("CreateFontW").Call(^uintptr(25), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(desktopString("微软雅黑"))))
-	view.bodyFont, _, _ = desktopGDI.NewProc("CreateFontW").Call(^uintptr(12), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(desktopString("微软雅黑"))))
-	view.backgroundBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(rgb(9, 15, 25))
-	view.panelBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(rgb(18, 29, 45))
-	view.editBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(rgb(15, 24, 38))
-	view.status = view.control("EDIT", "正在读取后台状态……", 0x50A00844, 11)
-	view.output = view.control("EDIT", "点击“一键检测”查看六步诊断和建议。这里的文字可选中并复制。", 0x50A00844, 12)
-	labels := []string{"启动后台", "停止后台", "一键检测", "设置"}
-	for i, label := range labels {
-		view.buttons[i] = view.control("BUTTON", label, 0x50010000|0x0000000B, uintptr(101+i))
+	view.rebuildFonts(desktopWindowDPI(window))
+	desktopApplyTitleTheme(window)
+	view.status = view.control("STATIC", view.panel.Title, 0x5000000C, 11)
+	view.control("STATIC", "诊断记录", 0x50000000, 117)
+	view.output = view.control("EDIT", "", 0x50010844, 12)
+	view.settingsLabels[0] = view.control("STATIC", "上游主机地址", 0x50000000, 113)
+	view.upstreamHost = view.control("EDIT", "", 0x50010080, 107)
+	view.settingsLabels[1] = view.control("STATIC", "端口", 0x50000000, 114)
+	view.upstreamPort = view.control("EDIT", "", 0x50012080, 108)
+	desktopCall("SendMessageW", view.upstreamHost, 0xC5, 253, 0)
+	desktopCall("SendMessageW", view.upstreamPort, 0xC5, 5, 0)
+	desktopCall("SendMessageW", view.output, 0xC5, 1<<20, 0)
+	for i, label := range []string{"启动后台", "停止后台", "运行诊断", "重新载入配置"} {
+		view.buttons[i] = view.control("BUTTON", label, 0x5001000B, uintptr(101+i))
 	}
+	view.saveSettings = view.control("BUTTON", "保存配置", 0x5001000B, 109)
+	view.copyOutput = view.control("BUTTON", "复制全部", 0x5001000B, 111)
+	view.detailButton = view.control("BUTTON", "查看详细记录", 0x5001000B, 112)
+	view.copyStatus = view.control("BUTTON", "复制状态", 0x5001000B, 116)
+	view.rebuildFonts(view.dpi)
 	view.tray = desktopNotify{Size: uint32(unsafe.Sizeof(desktopNotify{})), Window: window, ID: 1, Flags: 7, Callback: 0x8001, Icon: class.Icon}
 	copy(view.tray.Tip[:], syscall.StringToUTF16("路由助手：后台状态与诊断"))
 	view.addTray()
+	view.openSettings()
+	view.setOutput("尚未运行诊断。\r\n点击右上角“运行诊断”，检查配置、上游连接和本地代理状态。")
+	view.updateControls()
+	desktopFitInitialWindow(view)
 	desktopCall("SetTimer", window, 1, 3000, 0)
 	desktopCall("ShowWindow", window, 9)
-	// 首次显示可能被启动器的隐藏标志覆盖，第二次调用明确展示面板。
 	desktopCall("ShowWindow", window, 9)
-	desktopCall("UpdateWindow", window)
 	view.layout()
+	desktopCall("UpdateWindow", window)
 	view.readStatus()
 	var message desktopMessage
 	for {
@@ -176,120 +215,321 @@ func runDesktop(path string) error {
 		if int32(result) == -1 {
 			return fmt.Errorf("面板消息处理失败")
 		}
+		if view.handleKey(message) {
+			continue
+		}
+		if desktopCall("IsDialogMessageW", window, uintptr(unsafe.Pointer(&message))) != 0 {
+			continue
+		}
 		desktopCall("TranslateMessage", uintptr(unsafe.Pointer(&message)))
 		desktopCall("DispatchMessageW", uintptr(unsafe.Pointer(&message)))
 	}
 	runtime.KeepAlive(class)
 	return nil
 }
+
 func (v *desktopView) control(class, text string, style, id uintptr) uintptr {
 	h := desktopCall("CreateWindowExW", 0, uintptr(unsafe.Pointer(desktopString(class))), uintptr(unsafe.Pointer(desktopString(text))), style, 0, 0, 0, 0, v.window, id, 0, 0)
 	desktopCall("SendMessageW", h, 0x30, v.bodyFont, 1)
 	if class == "EDIT" {
-		desktopCall("SendMessageW", h, 0x00D3, 3, uintptr(12|(12<<16)))
+		desktopCall("SendMessageW", h, 0xD3, 3, uintptr(desktopScale(10, v.dpi)|(desktopScale(10, v.dpi)<<16)))
+	}
+	if class == "BUTTON" {
+		previous := desktopCall("SetWindowLongPtrW", h, ^uintptr(3), desktopButtonCallback)
+		if v.buttonProc == 0 {
+			v.buttonProc = previous
+		}
 	}
 	return h
 }
+
+func desktopGetText(window uintptr) string {
+	length := desktopCall("GetWindowTextLengthW", window)
+	buffer := make([]uint16, length+1)
+	desktopCall("GetWindowTextW", window, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
+	return windows.UTF16ToString(buffer)
+}
+
+func (v *desktopView) handleKey(message desktopMessage) bool {
+	if message.Message != 0x100 {
+		return false
+	}
+	focus := desktopCall("GetFocus")
+	if message.WParam == 9 {
+		order := []uintptr{v.buttons[0], v.buttons[2], v.copyStatus, v.upstreamHost, v.upstreamPort, v.buttons[3], v.saveSettings, v.detailButton, v.copyOutput, v.output}
+		position := -1
+		for i, control := range order {
+			if control == focus {
+				position = i
+				break
+			}
+		}
+		direction := 1
+		if desktopCall("GetKeyState", 0x10)&0x8000 != 0 {
+			direction = -1
+			if position < 0 {
+				position = 0
+			}
+		}
+		for attempt := 0; attempt < len(order); attempt++ {
+			position = (position + direction + len(order)) % len(order)
+			control := order[position]
+			if control != 0 && desktopCall("IsWindowVisible", control) != 0 && desktopCall("IsWindowEnabled", control) != 0 {
+				desktopCall("SendMessageW", v.window, 0x127, 0x10002, 0)
+				desktopCall("SetFocus", control)
+				return true
+			}
+		}
+		return true
+	}
+	if message.WParam == 13 {
+		if focus == v.upstreamHost || focus == v.upstreamPort {
+			if desktopCall("IsWindowEnabled", v.saveSettings) != 0 {
+				v.action(109)
+			}
+			return true
+		}
+		for _, button := range v.allButtons() {
+			if focus == button && desktopCall("IsWindowEnabled", button) != 0 {
+				v.action(desktopCall("GetDlgCtrlID", button))
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (v *desktopView) allButtons() []uintptr {
+	return append(v.buttons[:], v.saveSettings, v.copyOutput, v.detailButton, v.copyStatus)
+}
+
+func (v *desktopView) openSettings() {
+	cfg, err := config.Load(v.path)
+	if err != nil {
+		v.settingsNotice = desktopConfigNotice(err)
+		v.noticeFailed = true
+		v.settingsError = v.upstreamHost
+		v.updateControls()
+		return
+	}
+	v.settingsLoading = true
+	v.savedHost, v.savedPort = cfg.Upstream.Host, strconv.Itoa(cfg.Upstream.Port)
+	desktopCall("SetWindowTextW", v.upstreamHost, uintptr(unsafe.Pointer(desktopString(v.savedHost))))
+	desktopCall("SetWindowTextW", v.upstreamPort, uintptr(unsafe.Pointer(desktopString(v.savedPort))))
+	v.settingsLoading = false
+	v.dirty = false
+	v.settingsError = 0
+	v.settingsNotice = ""
+	v.noticeFailed = false
+	v.updateControls()
+}
+
+func (v *desktopView) settingsChanged() {
+	if v.settingsLoading {
+		return
+	}
+	v.dirty = strings.TrimSpace(desktopGetText(v.upstreamHost)) != v.savedHost || strings.TrimSpace(desktopGetText(v.upstreamPort)) != v.savedPort
+	v.settingsError = 0
+	v.settingsNotice = ""
+	v.noticeFailed = false
+	v.updateControls()
+}
+
+func (v *desktopView) settingsFailure(control uintptr, message string) {
+	v.settingsError = control
+	v.settingsNotice = message
+	v.noticeFailed = true
+	v.updateControls()
+	if control != 0 {
+		desktopCall("SetFocus", control)
+		desktopCall("SendMessageW", control, 0xB1, 0, ^uintptr(0))
+	}
+}
+
+func desktopValidateFields(host, portText string) (int, uintptr, string) {
+	host = strings.TrimSpace(host)
+	port, err := strconv.Atoi(strings.TrimSpace(portText))
+	if err != nil || port < 1 || port > 65535 {
+		return 0, 108, "端口范围为 1 至 65535。"
+	}
+	if host == "" || strings.ContainsAny(host, " /\\\t\r\n:@?#") && net.ParseIP(host) == nil {
+		return 0, 107, "请输入有效的主机名或地址，不要包含协议或端口。"
+	}
+	return port, 0, ""
+}
+
+func (v *desktopView) saveSettingsValues() {
+	if v.busy {
+		return
+	}
+	if v.panel.Running {
+		v.settingsFailure(0, "请先停止后台，再保存配置。")
+		return
+	}
+	host := strings.TrimSpace(desktopGetText(v.upstreamHost))
+	port, id, notice := desktopValidateFields(host, desktopGetText(v.upstreamPort))
+	if id != 0 {
+		control := v.upstreamHost
+		if id == 108 {
+			control = v.upstreamPort
+		}
+		v.settingsFailure(control, notice)
+		return
+	}
+	// 与后台进程共用互斥锁，保证保存时没有进程正在启动或管理代理。
+	release, lockErr := lockBackground()
+	if lockErr != nil {
+		v.settingsFailure(0, "后台正在运行或切换状态，请先停止后台再保存。")
+		return
+	}
+	defer release()
+	statePath, _ := backgroundPaths(v.path)
+	if _, err := readBackground(statePath); !errors.Is(err, os.ErrNotExist) {
+		v.settingsFailure(0, "后台状态尚未清理，请先执行停止或恢复代理设置。")
+		v.readStatus()
+		return
+	}
+	if err := config.UpdateUpstream(v.path, host, port); err != nil {
+		v.settingsFailure(v.upstreamHost, desktopConfigNotice(err))
+		return
+	}
+	v.savedHost, v.savedPort = host, strconv.Itoa(port)
+	v.settingsLoading = true
+	desktopCall("SetWindowTextW", v.upstreamPort, uintptr(unsafe.Pointer(desktopString(v.savedPort))))
+	v.settingsLoading = false
+	v.dirty = false
+	v.settingsError = 0
+	v.settingsNotice = "已保存，下次启动后台时生效。"
+	v.noticeFailed = false
+	v.updateControls()
+	v.readStatus()
+}
+
+func desktopConfigNotice(err error) string {
+	if errors.Is(err, os.ErrNotExist) {
+		return "配置文件不存在，请确认文件位置后重新载入。"
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return "无法读写配置，请检查文件访问权限。"
+	}
+	if strings.Contains(err.Error(), "上游地址不能与本地监听地址相同") {
+		return "上游地址不能与本地监听地址相同。"
+	}
+	if strings.Contains(err.Error(), "上游主机名或 IP 地址无效") {
+		return "上游主机地址无效，请检查主机名或地址格式。"
+	}
+	return "配置校验或保存失败，请检查地址、端口和配置文件。"
+}
+
+func (v *desktopView) updateControls() {
+	if v.window == 0 {
+		return
+	}
+	label := "启动后台"
+	if v.panel.Running {
+		label = "停止后台"
+	} else if v.panel.RestorePending {
+		label = "恢复代理设置"
+	}
+	if v.activeAction == 101 {
+		label = "正在启动…"
+	} else if v.activeAction == 102 {
+		label = "正在停止…"
+	}
+	desktopCall("SetWindowTextW", v.buttons[0], uintptr(unsafe.Pointer(desktopString(label))))
+	desktopCall("SetWindowTextW", v.status, uintptr(unsafe.Pointer(desktopString(v.panel.Title))))
+	for _, b := range v.buttons {
+		desktopCall("EnableWindow", b, boolUint(!v.busy))
+	}
+	desktopCall("ShowWindow", v.buttons[1], 0)
+	desktopCall("EnableWindow", v.saveSettings, boolUint(v.dirty && !v.busy && !v.panel.Running))
+	desktopCall("EnableWindow", v.upstreamHost, boolUint(!v.busy))
+	desktopCall("EnableWindow", v.upstreamPort, boolUint(!v.busy))
+	desktopCall("EnableWindow", v.detailButton, boolUint(!v.busy && v.diagnostic != nil))
+	desktopCall("EnableWindow", v.copyOutput, boolUint(v.outputText != ""))
+	for _, b := range v.allButtons() {
+		desktopCall("InvalidateRect", b, 0, 1)
+	}
+	desktopCall("SetWindowTextW", v.copyOutput, uintptr(unsafe.Pointer(desktopString("复制全部"))))
+	desktopCall("SetWindowTextW", v.copyStatus, uintptr(unsafe.Pointer(desktopString("复制状态"))))
+	desktopCall("InvalidateRect", v.window, 0, 0)
+}
+
+func boolUint(value bool) uintptr {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func (v *desktopView) setOutput(text string) {
+	text = strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\n", "\r\n")
+	if text == v.outputText {
+		return
+	}
+	v.outputText = text
+	desktopCall("SetWindowTextW", v.output, uintptr(unsafe.Pointer(desktopString(text))))
+	v.updateOutputScrollbar()
+}
+
+func (v *desktopView) showDiagnosis() {
+	if v.diagnostic == nil {
+		return
+	}
+	label := "查看详细记录"
+	text := desktopCompactDiagnosis(*v.diagnostic)
+	if v.expanded {
+		label = "收起详细记录"
+		text = v.diagnostic.Detail
+	}
+	desktopCall("SetWindowTextW", v.detailButton, uintptr(unsafe.Pointer(desktopString(label))))
+	v.setOutput(text)
+}
+
+func desktopCompactDiagnosis(report desktopDiagnosisReport) string {
+	var b strings.Builder
+	for _, step := range report.Steps {
+		fmt.Fprintf(&b, "%s  %s", step.Status, step.Name)
+		if step.DurationMS > 0 {
+			fmt.Fprintf(&b, "  ·  %d 毫秒", step.DurationMS)
+		}
+		b.WriteString("\n")
+		if step.Status != "通过" && step.Advice != "" {
+			b.WriteString("      建议：" + step.Advice + "\n")
+		}
+	}
+	if len(report.Steps) == 0 {
+		b.WriteString(report.Detail)
+	}
+	return b.String()
+}
+
 func (v *desktopView) addTray() {
 	result, _, _ := desktopShell.NewProc("Shell_NotifyIconW").Call(0, uintptr(unsafe.Pointer(&v.tray)))
 	v.trayReady = result != 0
 }
 
-func (v *desktopView) paint() {
-	var ps [72]byte
-	hdc, _, _ := desktopUser.NewProc("BeginPaint").Call(v.window, uintptr(unsafe.Pointer(&ps)))
-	if hdc == 0 {
-		return
-	}
-	defer desktopUser.NewProc("EndPaint").Call(v.window, uintptr(unsafe.Pointer(&ps)))
-	var rect desktopRect
-	desktopCall("GetClientRect", v.window, uintptr(unsafe.Pointer(&rect)))
-	desktopUser.NewProc("FillRect").Call(hdc, uintptr(unsafe.Pointer(&rect)), v.backgroundBrush)
-	width := rect.Right - rect.Left
-	desktopText(hdc, v.titleFont, "路由助手", 24, 18, width-48, 34, rgb(242, 246, 252))
-	desktopText(hdc, v.bodyFont, "本地应用的域名分流与运行状态", 26, 53, width-52, 20, rgb(145, 160, 181))
-	desktopText(hdc, v.bodyFont, "运行概览", 24, 75, 120, 20, rgb(122, 190, 255))
-	desktopText(hdc, v.bodyFont, "操作记录", 24, 315, 120, 20, rgb(122, 190, 255))
-	desktopText(hdc, v.bodyFont, "路由助手 · 本地运行", 24, rect.Bottom-24, width-48, 18, rgb(91, 108, 132))
-}
-
-func (v *desktopView) drawButton(item *desktopDrawItem) {
-	if item == nil || item.hDC == 0 {
-		return
-	}
-	colors := map[uint32][3]byte{
-		101: {52, 174, 122},
-		102: {185, 82, 93},
-		103: {62, 132, 205},
-		104: {43, 59, 80},
-	}
-	color := colors[item.CtlID]
-	// 按下和禁用状态都使用较深的底色，避免系统主题在按钮上绘出
-	// 白色高光，保证深色面板中的层级关系稳定。
-	if item.ItemState&1 != 0 {
-		color = [3]byte{35, 48, 66}
-	} else if item.ItemState&4 != 0 {
-		color = [3]byte{34, 44, 58}
-	}
-	brush, _, _ := desktopGDI.NewProc("CreateSolidBrush").Call(rgb(color[0], color[1], color[2]))
-	defer desktopGDI.NewProc("DeleteObject").Call(brush)
-	desktopUser.NewProc("FillRect").Call(item.hDC, uintptr(unsafe.Pointer(&item.rcItem)), brush)
-	borderColor := rgb(lighten(color[0]), lighten(color[1]), lighten(color[2]))
-	if item.ItemState&4 != 0 {
-		borderColor = rgb(66, 79, 98)
-	}
-	border, _, _ := desktopGDI.NewProc("CreatePen").Call(0, 1, borderColor)
-	defer desktopGDI.NewProc("DeleteObject").Call(border)
-	previousPen, _, _ := desktopGDI.NewProc("SelectObject").Call(item.hDC, border)
-	defer desktopGDI.NewProc("SelectObject").Call(item.hDC, previousPen)
-	previousBrush, _, _ := desktopGDI.NewProc("SelectObject").Call(item.hDC, brush)
-	defer desktopGDI.NewProc("SelectObject").Call(item.hDC, previousBrush)
-	desktopGDI.NewProc("Rectangle").Call(item.hDC, uintptr(item.rcItem.Left), uintptr(item.rcItem.Top), uintptr(item.rcItem.Right), uintptr(item.rcItem.Bottom))
-	label := map[uint32]string{101: "启动后台", 102: "停止后台", 103: "一键检测", 104: "设置"}[item.CtlID]
-	textColor := rgb(245, 248, 252)
-	if item.ItemState&4 != 0 {
-		textColor = rgb(133, 147, 166)
-	}
-	// 按钮文字水平、垂直居中，避免不同 DPI 下固定偏移造成视觉漂移。
-	desktopGDI.NewProc("SelectObject").Call(item.hDC, v.bodyFont)
-	desktopGDI.NewProc("SetTextColor").Call(item.hDC, textColor)
-	desktopGDI.NewProc("SetBkMode").Call(item.hDC, 1)
-	textRect := item.rcItem
-	desktopUser.NewProc("DrawTextW").Call(item.hDC, uintptr(unsafe.Pointer(desktopString(label))), ^uintptr(0), uintptr(unsafe.Pointer(&textRect)), 0x0025)
-}
-
-func lighten(v byte) byte {
-	if v > 237 {
-		return 255
-	}
-	return v + 18
-}
-func (v *desktopView) layout() {
-	var rect [4]int32
-	desktopCall("GetClientRect", v.window, uintptr(unsafe.Pointer(&rect)))
-	w, h := int(rect[2]), int(rect[3])
-	top := 238
-	desktopCall("MoveWindow", v.status, 24, 84, uintptr(w-48), 134, 1)
-	for i, b := range v.buttons {
-		width := 142
-		gap := 12
-		desktopCall("MoveWindow", b, uintptr(24+i*(width+gap)), uintptr(top), uintptr(width), 42, 1)
-	}
-	desktopCall("MoveWindow", v.output, 24, 334, uintptr(w-48), uintptr(h-370), 1)
-}
 func (v *desktopView) publish(r desktopResult) {
 	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.closed {
+		return
+	}
 	v.results = append(v.results, r)
-	v.mu.Unlock()
 	desktopCall("PostMessageW", v.window, 0x8002, 0, 0)
 }
+
 func (v *desktopView) readStatus() {
 	if v.refresh {
 		return
 	}
 	v.refresh = true
-	go func() { v.publish(desktopResult{status: true, text: desktopStatus(v.path)}) }()
+	generation := v.statusGeneration
+	go func() {
+		v.publish(desktopResult{status: true, panel: readDesktopPanelState(v.path), generation: generation})
+	}()
 }
+
 func (v *desktopView) action(id uintptr) {
 	if id == 105 {
 		desktopCall("ShowWindow", v.window, 9)
@@ -304,38 +544,89 @@ func (v *desktopView) action(id uintptr) {
 		desktopCall("DestroyWindow", v.window)
 		return
 	}
+	if id == 111 || id == 116 {
+		text := v.outputText
+		if id == 111 && v.diagnostic != nil {
+			text = v.diagnostic.Detail
+		}
+		if id == 116 {
+			text = fmt.Sprintf("%s\n%s\n本地入口：%s\n上游健康：%s\n%s\n最近应用连接：%s\n%s", v.panel.Title, v.panel.Subtitle, v.panel.Entry, v.panel.Health, v.panel.HealthDetail, v.panel.Target, v.panel.TargetDetail)
+		}
+		if err := desktopCopyText(v.window, text); err != nil {
+			v.settingsNotice = err.Error()
+			v.noticeFailed = true
+		} else if id == 111 {
+			if v.noticeFailed {
+				v.settingsNotice = ""
+				v.noticeFailed = false
+			}
+			desktopCall("SetWindowTextW", v.copyOutput, uintptr(unsafe.Pointer(desktopString("已复制"))))
+		} else {
+			if v.noticeFailed {
+				v.settingsNotice = ""
+				v.noticeFailed = false
+			}
+			desktopCall("SetWindowTextW", v.copyStatus, uintptr(unsafe.Pointer(desktopString("已复制"))))
+		}
+		desktopCall("InvalidateRect", v.window, 0, 0)
+		return
+	}
 	if v.busy {
 		return
 	}
-	if id == 104 {
-		desktopCall("MessageBoxW", v.window, uintptr(unsafe.Pointer(desktopString("请先停止后台，再修改配置，保存后重新启动后台。"))), uintptr(unsafe.Pointer(desktopString("设置提示"))), 0x40)
-		command := exec.Command("notepad.exe", v.path)
-		// 编辑器是用户明确请求的可见窗口。
-		if err := command.Start(); err != nil {
-			desktopCall("SetWindowTextW", v.output, uintptr(unsafe.Pointer(desktopString("无法打开配置文件："+err.Error()))))
-		} else {
-			go command.Wait()
-		}
+	if id == 112 {
+		v.expanded = !v.expanded
+		v.showDiagnosis()
+		v.updateControls()
 		return
 	}
-	actions := map[uintptr]string{101: "start", 102: "stop", 103: "diagnose"}
-	action, ok := actions[id]
-	if !ok {
+	if id == 104 {
+		if v.dirty && desktopCall("MessageBoxW", v.window, uintptr(unsafe.Pointer(desktopString("重新载入会覆盖尚未保存的修改，是否继续？"))), uintptr(unsafe.Pointer(desktopString("重新载入配置"))), 0x124) != 6 {
+			return
+		}
+		v.openSettings()
+		v.readStatus()
+		return
+	}
+	if id == 109 {
+		v.saveSettingsValues()
+		return
+	}
+	if id == 101 && (v.panel.Running || v.panel.RestorePending) {
+		id = 102
+	}
+	if id != 101 && id != 102 && id != 103 {
 		return
 	}
 	v.busy = true
-	for _, b := range v.buttons {
-		desktopCall("EnableWindow", b, 0)
+	v.statusGeneration++
+	v.activeAction = id
+	v.diagnostic = nil
+	v.expanded = false
+	label := "正在执行，请稍候……"
+	if id == 103 {
+		label = "正在运行六步诊断，请稍候……"
 	}
-	desktopCall("SetWindowTextW", v.output, uintptr(unsafe.Pointer(desktopString("正在执行，请稍候……"))))
-	go func() {
-		result, err := desktopAction(action, v.path)
+	v.setOutput(label)
+	v.updateControls()
+	go func(action uintptr) {
+		if action == 103 {
+			report := runDesktopDiagnosis(v.path)
+			v.publish(desktopResult{report: &report})
+			return
+		}
+		name := "start"
+		if action == 102 {
+			name = "stop"
+		}
+		result, err := desktopAction(name, v.path)
 		if err != nil {
-			result += "\r\n操作失败：" + err.Error()
+			result += "\n操作失败：" + err.Error()
 		}
 		v.publish(desktopResult{text: result})
-	}()
+	}(id)
 }
+
 func desktopWindowProc(window uintptr, message uint32, wparam, lparam uintptr) uintptr {
 	v := desktopCurrent
 	if v == nil {
@@ -347,46 +638,66 @@ func desktopWindowProc(window uintptr, message uint32, wparam, lparam uintptr) u
 	}
 	switch message {
 	case 0x24:
-		// 仅写入最小尺寸字段，保留系统提供的最大尺寸，避免整数消息参数参与指针转换。
-		minimum := desktopPoint{680, 560}
+		dpi := v.dpi
+		if dpi == 0 {
+			dpi = 96
+		}
+		r := desktopRect{0, 0, int32(desktopScale(680, dpi)), int32(desktopScale(620, dpi))}
+		adjust := desktopUser.NewProc("AdjustWindowRectExForDpi")
+		if adjust.Find() == nil {
+			adjust.Call(uintptr(unsafe.Pointer(&r)), 0x02CF0000, 0, 0, uintptr(dpi))
+		} else {
+			desktopCall("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), 0x02CF0000, 0, 0)
+		}
+		minimum := desktopPoint{r.Right - r.Left, r.Bottom - r.Top}
 		windows.NewLazySystemDLL("kernel32.dll").NewProc("RtlMoveMemory").Call(lparam+unsafe.Offsetof(desktopMinMax{}.MinimumTrack), uintptr(unsafe.Pointer(&minimum)), unsafe.Sizeof(minimum))
 		return 0
-	case 0x0f:
+	case 0x2E0:
+		desktopApplyDPIChange(v, wparam, lparam)
+		return 0
+	case 0x1A, 0x31A:
+		desktopApplyTitleTheme(window)
+		desktopCall("InvalidateRect", window, 0, 1)
+		return 0
+	case 0xF:
 		v.paint()
 		return 0
 	case 0x14:
 		return 1
 	case 0x133, 0x134, 0x135, 0x138:
-		hdc := wparam
-		desktopGDI.NewProc("SetTextColor").Call(hdc, rgb(226, 234, 245))
-		brush := v.editBrush
-		// 状态区使用略亮的面板底色，与下方诊断记录形成清晰层级。
-		if lparam == v.status {
-			brush = v.panelBrush
-			desktopGDI.NewProc("SetTextColor").Call(hdc, rgb(218, 231, 246))
+		color, brush := desktopInput, v.editBrush
+		if lparam == v.status || lparam == v.settingsLabels[0] || lparam == v.settingsLabels[1] || lparam == desktopCall("GetDlgItem", window, 117) {
+			color, brush = desktopSurface, v.panelBrush
 		}
-		backgroundColor := rgb(15, 24, 38)
-		if lparam == v.status {
-			backgroundColor = rgb(18, 29, 45)
-		}
-		desktopGDI.NewProc("SetBkColor").Call(hdc, backgroundColor)
-		desktopGDI.NewProc("SelectObject").Call(hdc, brush)
+		desktopGDI.NewProc("SetTextColor").Call(wparam, desktopTextPrimary)
+		desktopGDI.NewProc("SetBkColor").Call(wparam, color)
 		return brush
-	case 0x2b:
+	case 0x2B:
 		if lparam != 0 {
-			// 将系统绘图消息复制到本地结构，避免整数直接转换为指针。
 			var item desktopDrawItem
 			windows.NewLazySystemDLL("kernel32.dll").NewProc("RtlMoveMemory").Call(uintptr(unsafe.Pointer(&item)), lparam, unsafe.Sizeof(item))
 			v.drawButton(&item)
 		}
 		return 1
 	case 5:
-		if v.status != 0 {
+		if v.output != 0 {
 			v.layout()
+			desktopCall("InvalidateRect", window, 0, 0)
 		}
 		return 0
 	case 0x111:
-		v.action(wparam & 0xffff)
+		id := wparam & 0xFFFF
+		if (id == 107 || id == 108) && wparam>>16 == 0x300 {
+			v.settingsChanged()
+			return 0
+		}
+		if (id == 107 || id == 108) && (wparam>>16 == 0x100 || wparam>>16 == 0x200) {
+			desktopCall("InvalidateRect", window, 0, 0)
+			return 0
+		}
+		if wparam>>16 == 0 {
+			v.action(id)
+		}
 		return 0
 	case 0x113:
 		v.readStatus()
@@ -408,12 +719,14 @@ func desktopWindowProc(window uintptr, message uint32, wparam, lparam uintptr) u
 		v.tray.Flags = 7
 		return 0
 	case 2:
-		desktopGDI.NewProc("DeleteObject").Call(v.font)
-		desktopGDI.NewProc("DeleteObject").Call(v.titleFont)
-		desktopGDI.NewProc("DeleteObject").Call(v.bodyFont)
-		desktopGDI.NewProc("DeleteObject").Call(v.backgroundBrush)
-		desktopGDI.NewProc("DeleteObject").Call(v.panelBrush)
-		desktopGDI.NewProc("DeleteObject").Call(v.editBrush)
+		v.mu.Lock()
+		v.closed = true
+		v.mu.Unlock()
+		for _, object := range []uintptr{v.font, v.titleFont, v.bodyFont, v.labelFont, v.backgroundBrush, v.panelBrush, v.editBrush} {
+			if object != 0 {
+				desktopGDI.NewProc("DeleteObject").Call(object)
+			}
+		}
 		desktopCall("KillTimer", window, 1)
 		desktopShell.NewProc("Shell_NotifyIconW").Call(2, uintptr(unsafe.Pointer(&v.tray)))
 		desktopCall("PostQuitMessage", 0)
@@ -426,18 +739,31 @@ func desktopWindowProc(window uintptr, message uint32, wparam, lparam uintptr) u
 		results := v.results
 		v.results = nil
 		v.mu.Unlock()
+		needRefresh := false
 		for _, r := range results {
-			target := v.output
 			if r.status {
-				target = v.status
 				v.refresh = false
+				if r.generation == v.statusGeneration {
+					v.panel = r.panel
+				} else {
+					needRefresh = true
+				}
 			} else {
 				v.busy = false
-				for _, b := range v.buttons {
-					desktopCall("EnableWindow", b, 1)
+				v.statusGeneration++
+				v.activeAction = 0
+				needRefresh = true
+				if r.report != nil {
+					v.diagnostic = r.report
+					v.showDiagnosis()
+				} else {
+					v.setOutput(r.text)
 				}
 			}
-			desktopCall("SetWindowTextW", target, uintptr(unsafe.Pointer(desktopString(strings.ReplaceAll(strings.ReplaceAll(r.text, "\r\n", "\n"), "\n", "\r\n")))))
+		}
+		v.updateControls()
+		if needRefresh {
+			v.readStatus()
 		}
 		return 0
 	case 0x8001:
@@ -445,15 +771,15 @@ func desktopWindowProc(window uintptr, message uint32, wparam, lparam uintptr) u
 			v.action(105)
 			return 0
 		}
-		if lparam == 0x205 || lparam == 0x7b {
+		if lparam == 0x205 || lparam == 0x7B {
 			menu := desktopCall("CreatePopupMenu")
 			defer desktopCall("DestroyMenu", menu)
 			for _, entry := range []struct {
 				id   uintptr
 				text string
-			}{{105, "显示状态面板"}, {101, "启动后台"}, {102, "停止后台"}, {103, "一键检测"}, {104, "设置"}, {106, "退出面板（后台继续运行）"}} {
+			}{{105, "显示状态面板"}, {101, "启动后台"}, {102, "停止后台并恢复代理"}, {103, "运行诊断"}, {104, "重新载入配置"}, {106, "退出面板（后台继续运行）"}} {
 				flags := uintptr(0)
-				if v.busy && entry.id >= 101 && entry.id <= 104 {
+				if (v.busy && entry.id >= 101 && entry.id <= 104) || (entry.id == 101 && (v.panel.Running || v.panel.RestorePending)) {
 					flags = 1
 				}
 				desktopCall("AppendMenuW", menu, flags, entry.id, uintptr(unsafe.Pointer(desktopString(entry.text))))
@@ -461,7 +787,7 @@ func desktopWindowProc(window uintptr, message uint32, wparam, lparam uintptr) u
 			var point desktopPoint
 			desktopCall("GetCursorPos", uintptr(unsafe.Pointer(&point)))
 			desktopCall("SetForegroundWindow", window)
-			id := desktopCall("TrackPopupMenu", menu, 0x100|2, uintptr(point.X), uintptr(point.Y), 0, window, 0)
+			id := desktopCall("TrackPopupMenu", menu, 0x102, uintptr(point.X), uintptr(point.Y), 0, window, 0)
 			if id != 0 {
 				v.action(id)
 			}

@@ -52,19 +52,6 @@ function Copy-ReleaseFile([string]$source, [string]$destination, [bool]$preserve
     Copy-Item -LiteralPath $source -Destination $destination -Force
 }
 
-function Copy-ReleaseBatchFile([string]$source, [string]$destination) {
-    Assert-ReleasePath $destination
-    $bytes = [System.IO.File]::ReadAllBytes($source)
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        throw "批处理源文件必须为无 BOM 的 UTF-8：$source"
-    }
-    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
-    try { $text = $strictUtf8.GetString($bytes) }
-    catch { throw "批处理源文件不是有效 UTF-8：$source" }
-    $crlfText = [System.Text.RegularExpressions.Regex]::Replace($text, "\r\n|\n|\r", "`r`n")
-    [System.IO.File]::WriteAllText($destination, $crlfText, [System.Text.UTF8Encoding]::new($false))
-}
-
 Push-Location $projectRoot
 try {
     $binary = Join-Path $windowsRelease 'CodexRouter.exe'
@@ -76,7 +63,7 @@ try {
         $env:GOOS = 'windows'
         $env:GOARCH = 'amd64'
         $env:CGO_ENABLED = '0'
-        & $go build -buildvcs=false -trimpath -o $binary ./cmd
+        & $go build -buildvcs=false -trimpath -ldflags '-H=windowsgui' -o $binary ./cmd
         if ($LASTEXITCODE -ne 0) { throw 'Windows 程序构建失败。' }
     } finally {
         $env:GOOS = $previousOS
@@ -87,11 +74,10 @@ try {
     Copy-ReleaseFile (Join-Path $projectRoot 'config.yaml') (Join-Path $windowsRelease 'config.yaml') $true
     Copy-ReleaseFile (Join-Path $projectRoot 'README.md') (Join-Path $windowsRelease 'README.md')
     Copy-ReleaseFile (Join-Path $projectRoot '验证记录.md') (Join-Path $windowsRelease '验证记录.md')
-    $oldLauncher = Join-Path $windowsRelease '启动应用.cmd'
-    Assert-ReleasePath $oldLauncher
-    if (Test-Path -LiteralPath $oldLauncher) { Remove-Item -LiteralPath $oldLauncher -Force }
-    foreach ($scriptName in @('状态面板.cmd', '启动代理.cmd', '检测出口.cmd', '结束代理.cmd')) {
-        Copy-ReleaseBatchFile (Join-Path $PSScriptRoot $scriptName) (Join-Path $windowsRelease $scriptName)
+    # 清理旧版本的批处理入口及程序备份，保留配置、日志和代理恢复数据。
+    foreach ($oldEntry in (Get-ChildItem -LiteralPath $windowsRelease -File -Force | Where-Object { $_.Extension -eq '.cmd' -or $_.Name -eq 'CodexRouter.exe~' })) {
+        Assert-ReleasePath $oldEntry.FullName
+        Remove-Item -LiteralPath $oldEntry.FullName -Force
     }
     $thirdPartySource = Join-Path $projectRoot 'third_party'
     $thirdParty = Join-Path $windowsRelease 'third_party'
@@ -116,10 +102,6 @@ try {
     if ($reparsePoints) { throw "Windows 发布目录含有链接或联接，拒绝打包：$($reparsePoints[0].FullName)" }
     $archiveItems = @(
         (Join-Path $windowsRelease 'CodexRouter.exe'),
-        (Join-Path $windowsRelease '状态面板.cmd'),
-        (Join-Path $windowsRelease '启动代理.cmd'),
-        (Join-Path $windowsRelease '检测出口.cmd'),
-        (Join-Path $windowsRelease '结束代理.cmd'),
         (Join-Path $windowsRelease 'config.yaml'),
         (Join-Path $windowsRelease 'README.md'),
         (Join-Path $windowsRelease '验证记录.md'),
