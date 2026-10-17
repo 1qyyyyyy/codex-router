@@ -23,7 +23,7 @@ import (
 	"codex-router/service"
 )
 
-const version = "1.3.0"
+const version = "1.3.1"
 
 func main() {
 	if err := execute(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -363,7 +363,7 @@ func newLoggerWithOutput(path, configuredLevel string, console io.Writer) (*slog
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, func() {}, fmt.Errorf("创建日志目录失败：%w", err)
 	}
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	file, err := newRotatingFile(path, maxLogFileSize, maxLogBackups)
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("打开日志文件失败：%w", err)
 	}

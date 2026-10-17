@@ -124,7 +124,9 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 	}
 	cfg.Server.Port = free.Addr().(*net.TCPAddr).Port
 	free.Close()
-	cfg.Health.URL = "http://chatgpt.com/路由验证"
+	// 使用保留测试域名，避免把正在运行应用的连接引向模拟源站或计入断言。
+	cfg.Targets = []string{"router-test.invalid"}
+	cfg.Health.URL = "http://router-test.invalid/路由验证"
 	cfg.Health.TimeoutSeconds = 3
 	path := filepath.Join(directory, "config.yaml")
 	configData, _ := yaml.Marshal(cfg)
@@ -140,6 +142,9 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 		output, err := run("stop")
 		if err != nil {
 			t.Errorf("清理后台失败：%s，%v", output, err)
+		}
+		if after := currentProxyRegistry(t); !reflect.DeepEqual(before, after) {
+			t.Error("测试清理后代理设置未精确恢复")
 		}
 	})
 	output, err := run("start")
@@ -207,7 +212,7 @@ func TestBackgroundLifecycleRealWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.WriteString(tunnel, "CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com:443\r\n\r\n")
+	_, _ = io.WriteString(tunnel, "CONNECT router-test.invalid:443 HTTP/1.1\r\nHost: router-test.invalid:443\r\n\r\n")
 	reader := bufio.NewReader(tunnel)
 	line, err := reader.ReadString('\n')
 	if err != nil || !strings.Contains(line, "200") {

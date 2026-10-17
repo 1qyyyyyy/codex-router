@@ -1,0 +1,64 @@
+name: 验证与打包
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: 视窗验证（${{ matrix.go }}）
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.23.x', 'stable']
+    steps:
+      - name: 读取源码
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: 准备编译器
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+      - name: 执行回归、恢复验证与发布校验
+        shell: pwsh
+        env:
+          GOTOOLCHAIN: local
+        run: .\scripts\verify.ps1 -GoExecutable (Get-Command go).Source -RunLifecycle
+      - name: 保存通过验证的发布包
+        if: matrix.go == 'stable'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release
+          path: |
+            release/CodexRouter-windows.zip
+            release/CodexRouter-windows.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: 非视窗回归与并发检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 读取源码
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: 准备编译器
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: 执行并发回归与静态检查
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go mod verify
+          go test -race ./... -count=1
+          go vet ./...

@@ -43,13 +43,23 @@ func New(cfg *config.Config, dial func(context.Context, string, string) (net.Con
 
 // Check 通过上游发起一次 HTTP 检测，且不会跟随重定向。
 func (c *Checker) Check(ctx context.Context) (result Result) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	started := time.Now()
 	result = Result{Time: started, Status: "异常"}
 	if c.cfg != nil {
 		result.Node = c.cfg.Upstream.Name
 	}
 	defer func() {
+		if ctx.Err() != nil {
+			result.Status = "已取消"
+			result.Error = "健康检测已取消"
+		}
 		result.LatencyMS = time.Since(started).Milliseconds()
+		if result.Status == "已取消" {
+			return
+		}
 		if err := c.save(result); err != nil {
 			c.logger.Error("保存健康状态失败", "错误", err)
 		}
@@ -64,6 +74,11 @@ func (c *Checker) Check(ctx context.Context) (result Result) {
 	}
 	if result.Node == "" {
 		result.Node = c.cfg.Upstream.Host
+	}
+	if ctx.Err() != nil {
+		result.Status = "已取消"
+		result.Error = "健康检测已取消"
+		return result
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(c.cfg.Health.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -90,6 +105,11 @@ func (c *Checker) Check(ctx context.Context) (result Result) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			result.Status = "已取消"
+			result.Error = "健康检测已取消"
+			return result
+		}
 		// 网络库错误可能包含完整 URL，其中可能带有查询参数，因此不输出原始错误。
 		result.Error = "通过上游进行健康检测失败：连接、超时或 TLS 握手异常"
 		return result
@@ -111,6 +131,9 @@ func (c *Checker) Check(ctx context.Context) (result Result) {
 
 // Run 立即检测一次，之后按配置间隔重复检测，直到上下文取消。
 func (c *Checker) Run(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.cfg == nil || c.cfg.Health.IntervalSeconds < 1 || c.cfg.Health.IntervalSeconds > config.MaxHealthSeconds {
 		c.logger.Error("健康检测间隔配置无效")
 		return
@@ -118,6 +141,9 @@ func (c *Checker) Run(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(c.cfg.Health.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		c.Check(ctx)
 		select {
 		case <-ctx.Done():

@@ -97,6 +97,123 @@ func TestLoggerHonorsConfiguredLevelAndChineseFields(t *testing.T) {
 	}
 }
 
+func TestRotatingFileKeepsSizeLimitAndOnlyConfiguredBackups(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "router.log")
+	writer, err := newRotatingFile(path, 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []string{"abcde", "f", "ghij", "k"} {
+		if _, err := writer.Write([]byte(data)); err != nil {
+			t.Fatalf("写入日志失败：%v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ path, want string }{
+		{path, "k"}, {path + ".1", "fghij"}, {path + ".2", "abcde"},
+	} {
+		data, err := os.ReadFile(test.path)
+		if err != nil || string(data) != test.want {
+			t.Errorf("日志文件 %s 内容为 %q，错误 %v，预期 %q", test.path, data, err, test.want)
+		}
+		if len(data) > 5 {
+			t.Errorf("日志文件 %s 超过大小上限：%d", test.path, len(data))
+		}
+	}
+	if _, err := os.Stat(path + ".3"); !os.IsNotExist(err) {
+		t.Errorf("不应保留超出数量上限的备份：%v", err)
+	}
+}
+
+func TestRotatingFileTruncatesOversizedRecordToStayBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "router.log")
+	writer, err := newRotatingFile(path, 4, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := writer.Write([]byte("abcdef")); err != nil || n != 6 {
+		t.Fatalf("超长日志写入结果为 %d，错误 %v", n, err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "cdef" {
+		t.Fatalf("超长日志保留内容为 %q，错误 %v，预期保留末尾数据", data, err)
+	}
+}
+
+func TestRotatingFileResumesWritingAfterRotationFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "router.log")
+	writer, err := newRotatingFile(path, 5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("abcde")); err != nil {
+		t.Fatal(err)
+	}
+	backupDirectory := path + ".1"
+	if err := os.Mkdir(backupDirectory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDirectory, "占位"), []byte("保留"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("f")); err == nil {
+		t.Fatal("备份路径被占用时应报告轮转失败")
+	}
+	if err := os.RemoveAll(backupDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("f")); err != nil {
+		t.Fatalf("轮转失败后应继续写日志：%v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil || string(current) != "f" {
+		t.Fatalf("当前日志内容为 %q，错误 %v，预期 f", current, err)
+	}
+	backup, err := os.ReadFile(path + ".1")
+	if err != nil || string(backup) != "abcde" {
+		t.Fatalf("日志备份内容为 %q，错误 %v，预期 abcde", backup, err)
+	}
+}
+
+func TestRotatingFileTrimsOversizedExistingLogsDuringUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "router.log")
+	for file, content := range map[string]string{
+		path:        "abcdefgh",
+		path + ".1": "0123456789",
+		path + ".2": "uvwxyz",
+	} {
+		if err := os.WriteFile(file, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writer, err := newRotatingFile(path, 4, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ path, want string }{
+		{path, ""}, {path + ".1", "efgh"}, {path + ".2", "6789"},
+	} {
+		data, err := os.ReadFile(test.path)
+		if err != nil || string(data) != test.want {
+			t.Errorf("升级后日志 %s 内容为 %q，错误 %v，预期 %q", test.path, data, err, test.want)
+		}
+		if len(data) > 4 {
+			t.Errorf("升级后日志 %s 仍超过大小上限：%d", test.path, len(data))
+		}
+	}
+}
+
 func TestRestoreUsesBackupWithoutLoadingConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "不存在的配置.yaml")
 	err := systemProxy("restore", path)

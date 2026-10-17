@@ -16,6 +16,11 @@ import (
 	"codex-router/config"
 )
 
+const (
+	maxActiveRequests     = 256
+	responseHeaderTimeout = 2 * time.Minute
+)
+
 type Server struct {
 	observations     *observations
 	cfg              *config.Config
@@ -32,6 +37,7 @@ type Server struct {
 	detectedProtocol func() string
 	protocolMu       sync.Mutex
 	loggedProtocol   string
+	requestSlots     chan struct{}
 }
 
 // New 校验配置并创建本地代理服务。
@@ -50,9 +56,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{observations: newObservations(), cfg: cfg, logger: logger, upstream: up, active: make(map[net.Conn]struct{}), ctx: ctx, cancel: cancel, detectedProtocol: detected}
-	s.transport = &http.Transport{Proxy: nil, ForceAttemptHTTP2: false, DisableKeepAlives: false, ResponseHeaderTimeout: 0,
-		DialContext: s.dial, TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: time.Second}
+	s := &Server{observations: newObservations(), cfg: cfg, logger: logger, upstream: up, active: make(map[net.Conn]struct{}), ctx: ctx, cancel: cancel, detectedProtocol: detected, requestSlots: make(chan struct{}, maxActiveRequests)}
+	// 只限制响应头等待和连接池规模；正文及已建立的隧道保留持续流式传输能力。
+	s.transport = &http.Transport{Proxy: nil, ForceAttemptHTTP2: false, DisableKeepAlives: false, ResponseHeaderTimeout: responseHeaderTimeout,
+		DialContext: s.dial, TLSHandshakeTimeout: 10 * time.Second, ExpectContinueTimeout: time.Second,
+		MaxIdleConns: 64, MaxIdleConnsPerHost: 16, IdleConnTimeout: 90 * time.Second}
 	s.httpServer = &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second, BaseContext: func(net.Listener) context.Context { return ctx }}
 	return s, nil
 }
@@ -126,6 +134,24 @@ func (s *Server) add(c net.Conn) bool {
 }
 func (s *Server) remove(c net.Conn) { s.mu.Lock(); delete(s.active, c); s.mu.Unlock(); _ = c.Close() }
 
+// acquireRequest 对普通请求和整个隧道生命周期共用额度，超限时立即返回而不排队。
+func (s *Server) acquireRequest(w http.ResponseWriter) bool {
+	if s.ctx.Err() != nil {
+		http.Error(w, "代理正在停止", http.StatusServiceUnavailable)
+		return false
+	}
+	select {
+	case s.requestSlots <- struct{}{}:
+		return true
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "代理活动连接已达上限，请稍后重试", http.StatusServiceUnavailable)
+		return false
+	}
+}
+
+func (s *Server) releaseRequest() { <-s.requestSlots }
+
 func (s *Server) startTunnel(client net.Conn, buffered io.Reader, upstream net.Conn, host, node string, started time.Time) bool {
 	s.mu.Lock()
 	if s.closed {
@@ -138,7 +164,11 @@ func (s *Server) startTunnel(client net.Conn, buffered io.Reader, upstream net.C
 	}
 	s.tunnelWG.Add(1)
 	s.mu.Unlock()
-	go func() { defer s.tunnelWG.Done(); s.tunnel(client, buffered, upstream, host, node, started) }()
+	go func() {
+		defer s.tunnelWG.Done()
+		defer s.releaseRequest()
+		s.tunnel(client, buffered, upstream, host, node, started)
+	}()
 	return true
 }
 
@@ -162,6 +192,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.handleConnect(w, r)
 		return
 	}
+	if !s.acquireRequest(w) {
+		return
+	}
+	defer s.releaseRequest()
 	target := r.URL
 	if target.Host == "" {
 		if r.Host == "" {
@@ -272,6 +306,15 @@ func stripHopHeaders(h http.Header) {
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
+	if !s.acquireRequest(w) {
+		return
+	}
+	releaseInHandler := true
+	defer func() {
+		if releaseInHandler {
+			s.releaseRequest()
+		}
+	}()
 	internal := s.internalRequest(r)
 	target := r.Host
 	if target == "" {
@@ -328,7 +371,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("CONNECT 已建立", "目标", host, "节点", node, "延迟毫秒", time.Since(started).Milliseconds(), "状态", http.StatusOK)
 	if !s.startTunnel(client, bw.Reader, up, host, node, started) {
 		s.logger.Warn("CONNECT 隧道启动失败", "目标", host, "节点", node, "延迟毫秒", time.Since(started).Milliseconds(), "状态", http.StatusBadGateway)
+		return
 	}
+	// 隧道脱离请求处理器后，由隧道协程在实际关闭连接时归还额度。
+	releaseInHandler = false
 }
 
 func (s *Server) tunnel(client net.Conn, buffered io.Reader, upstream net.Conn, host, node string, started time.Time) {

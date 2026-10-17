@@ -3,6 +3,7 @@
 package main
 
 import (
+	"codex-router/config"
 	"codex-router/diagnosis"
 	"codex-router/health"
 	"codex-router/proxy"
@@ -38,6 +39,29 @@ func TestDesktopNativeStructureLayout(t *testing.T) {
 		if item.actual != item.expected {
 			t.Errorf("%s结构不匹配：实际%d，预期%d", item.name, item.actual, item.expected)
 		}
+	}
+}
+
+func TestDesktopConfigNoticeUsesSafeStructuredMessage(t *testing.T) {
+	testCases := []struct {
+		name        string
+		configError *config.ConfigError
+		want        string
+		secret      string
+	}{
+		{"语法提示", &config.ConfigError{Category: config.ErrorSyntax, Field: "health.url", Line: 12, Message: "第 12 行的 health.url 配置有误。请检查引号。"}, "第 12 行", "PASSWORD_SENTINEL"},
+		{"字段校验提示", &config.ConfigError{Category: config.ErrorValidation, Field: "upstream.host", Message: "配置字段 upstream.host 不符合要求。请检查主机名。"}, "upstream.host", "QUERY_SENTINEL"},
+	}
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			got := desktopConfigNotice(test.configError)
+			if !strings.Contains(got, test.want) {
+				t.Fatalf("安全提示缺少关键信息：%q", got)
+			}
+			if strings.Contains(got, test.secret) {
+				t.Fatalf("安全提示泄漏了配置值：%q", got)
+			}
+		})
 	}
 }
 

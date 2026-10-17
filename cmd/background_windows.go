@@ -167,7 +167,8 @@ func backgroundCommand(action, path string, out io.Writer) error {
 		if err := os.MkdirAll(filepath.Dir(logPath), 0700); err != nil {
 			return err
 		}
-		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		// 此文件只保存本次启动失败信息，每次启动覆盖旧内容，避免历史错误累积。
+		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 		if err != nil {
 			return err
 		}
@@ -227,7 +228,7 @@ func backgroundWorker(path string) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	logger, closeLog, err := newLogger(cfg.Log.File, cfg.Log.Level)
+	logger, closeLog, err := newLoggerWithOutput(cfg.Log.File, cfg.Log.Level, io.Discard)
 	if err != nil {
 		return err
 	}
@@ -350,6 +351,9 @@ func backgroundWorker(path string) (resultErr error) {
 				return
 			case <-ticker.C:
 				result := checker.Check(ctx)
+				if ctx.Err() != nil || result.Status == "已取消" {
+					return
+				}
 				healthMu.Lock()
 				currentHealth = result
 				healthMu.Unlock()

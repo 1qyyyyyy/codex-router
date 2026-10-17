@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,109 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestLoadReturnsSafeStructuredConfigErrors(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "config.yaml")
+	valid := `server:
+  host: 127.0.0.1
+  port: 17890
+upstream:
+  type: auto
+  host: 127.0.0.1
+  port: 1080
+  password: "PASSWORD_SENTINEL"
+targets: [api.openai.com]
+log: {level: info, file: logs/router.log}
+health: {url: "https://example.com/check?token=QUERY_SENTINEL", interval_seconds: 30, timeout_seconds: 5, state_file: state.json}
+`
+	for _, test := range []struct {
+		name, content string
+		category      ErrorCategory
+		field         string
+		line          int
+		advice        string
+	}{
+		{"语法错误", strings.Replace(valid, `password: "PASSWORD_SENTINEL"`, `password: "PASSWORD_SENTINEL`, 1), ErrorSyntax, "配置文件", 11, "引号"},
+		{"未知字段", strings.Replace(valid, "  type: auto", "  PASSWORD_SENTINEL: true", 1), ErrorUnknownField, "upstream", 0, "未识别字段"},
+		{"类型错误", strings.Replace(valid, "  port: 1080", "  port: PASSWORD_SENTINEL", 1), ErrorType, "upstream.port", 7, "数据类型"},
+		{"类型与未知字段混合", strings.Replace(valid, "  port: 1080", "  port: PASSWORD_SENTINEL\n  PASSWORD_SENTINEL: true", 1), ErrorType, "upstream.port", 7, "数据类型"},
+		{"嵌套类型错误", strings.Replace(valid, "  type: auto", "  type:\n    password: PASSWORD_SENTINEL", 1), ErrorType, "upstream.type", 6, "数据类型"},
+		{"重复字段", strings.Replace(valid, "  port: 1080", "  port: 1080\n  port: 1081", 1), ErrorSyntax, "upstream.port", 8, "重复字段"},
+		{"字段校验", strings.Replace(valid, "targets: [api.openai.com]", "targets: [PASSWORD_SENTINEL]", 1), ErrorValidation, "targets", 9, "域名"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(test.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("预期配置错误")
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("错误未结构化：%T", err)
+			}
+			if configErr.Category != test.category {
+				t.Errorf("类别=%q，预期 %q", configErr.Category, test.category)
+			}
+			if !strings.Contains(configErr.Field, test.field) {
+				t.Errorf("字段提示缺失：%q", configErr.Field)
+			}
+			if test.line != 0 && configErr.Line != test.line {
+				t.Errorf("行号=%d，预期 %d", configErr.Line, test.line)
+			}
+			if test.category == ErrorValidation && test.line > 0 && !strings.Contains(configErr.Message, "第 9 行") {
+				t.Errorf("用户提示未展示字段行号：%q", configErr.Message)
+			}
+			if !strings.Contains(configErr.Message, test.advice) {
+				t.Errorf("缺少操作建议：%q", configErr.Message)
+			}
+			if strings.Contains(err.Error(), "PASSWORD_SENTINEL") || strings.Contains(err.Error(), "QUERY_SENTINEL") {
+				t.Errorf("错误泄漏了配置值：%s", err)
+			}
+		})
+	}
+}
+
+func TestLoadMissingPasswordEnvironmentShowsSafeLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	content := `server: {host: 127.0.0.1, port: 17890}
+upstream: {type: auto, host: 127.0.0.1, port: 1080, password: "${ROUTER_MISSING_SECRET}"}
+targets: [api.openai.com]
+log: {level: info, file: logs/router.log}
+health: {url: https://example.com/, interval_seconds: 30, timeout_seconds: 5, state_file: state.json}
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ROUTER_MISSING_SECRET", "")
+	if err := os.Unsetenv("ROUTER_MISSING_SECRET"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("应返回结构化环境变量错误：%v", err)
+	}
+	if configErr.Field != "upstream.password" || configErr.Line != 2 {
+		t.Fatalf("字段或行号不正确：%+v", configErr)
+	}
+	if !strings.Contains(configErr.Message, "第 2 行") || strings.Contains(err.Error(), "ROUTER_MISSING_SECRET") {
+		t.Fatalf("安全提示未展示行号或泄漏变量名：%s", err)
+	}
+}
+
+func TestLoadReadErrorPreservesIs(t *testing.T) {
+	_, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("应保留文件不存在语义：%v", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) || configErr.Category != ErrorRead {
+		t.Fatalf("应返回结构化读取错误：%v", err)
+	}
+}
 
 func TestUpdateUpstream(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -33,9 +137,19 @@ func TestUpdateUpstream(t *testing.T) {
 	}
 	if err := UpdateUpstream(path, "bad..host", 7890); err == nil {
 		t.Fatal("非法主机名应被拒绝")
+	} else {
+		var configErr *ConfigError
+		if !errors.As(err, &configErr) || configErr.Field != "upstream.host" || !strings.Contains(err.Error(), "主机名") {
+			t.Fatalf("保存时非法主机应保留可定位提示：%v", err)
+		}
 	}
 	if err := UpdateUpstream(path, "192.168.1.20", 0); err == nil {
 		t.Fatal("非法端口应被拒绝")
+	} else {
+		var configErr *ConfigError
+		if !errors.As(err, &configErr) || configErr.Field != "upstream.port" {
+			t.Fatalf("保存时非法端口应保留字段提示：%v", err)
+		}
 	}
 }
 

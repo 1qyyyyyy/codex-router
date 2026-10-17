@@ -111,7 +111,13 @@ try {
         Assert-ReleasePath $item
         if (-not (Test-Path -LiteralPath $item)) { throw "发布文件缺失：$item" }
     }
+    $hashPath = $zipPath + '.sha256'
+    Assert-ReleasePath $hashPath
+    if (Test-Path -LiteralPath $hashPath) { Remove-Item -LiteralPath $hashPath -Force }
     Compress-Archive -Path $archiveItems -DestinationPath $zipPath -CompressionLevel Optimal -Force
+    & (Join-Path $PSScriptRoot 'verify-package.ps1') -ArchivePath $zipPath -ReleaseDirectory $windowsRelease
+    $archiveHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    [System.IO.File]::WriteAllText($hashPath, $archiveHash + '  ' + [System.IO.Path]::GetFileName($zipPath) + [System.Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 } finally {
     Pop-Location
 }

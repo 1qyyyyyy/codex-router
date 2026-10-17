@@ -412,13 +412,11 @@ func desktopConfigNotice(err error) string {
 	if errors.Is(err, os.ErrPermission) {
 		return "无法读写配置，请检查文件访问权限。"
 	}
-	if strings.Contains(err.Error(), "上游地址不能与本地监听地址相同") {
-		return "上游地址不能与本地监听地址相同。"
+	var configErr *config.ConfigError
+	if errors.As(err, &configErr) {
+		return configErr.Message
 	}
-	if strings.Contains(err.Error(), "上游主机名或 IP 地址无效") {
-		return "上游主机地址无效，请检查主机名或地址格式。"
-	}
-	return "配置校验或保存失败，请检查地址、端口和配置文件。"
+	return "配置操作失败，请检查配置文件内容和访问权限。"
 }
 
 func (v *desktopView) updateControls() {
