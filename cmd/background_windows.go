@@ -275,6 +275,7 @@ func backgroundWorker(path string) (resultErr error) {
 	startedAt := time.Now()
 	var healthMu sync.Mutex
 	currentHealth := check
+	latency := &health.LatencyMonitor{}
 	var stopping atomic.Bool
 	stopped := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -289,7 +290,7 @@ func backgroundWorker(path string) (resultErr error) {
 			currentConfig, configErr := config.Load(path)
 			configChanged := configErr != nil || !reflect.DeepEqual(cfg, currentConfig)
 			writer.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(writer).Encode(statusSnapshot{ConfigChanged: configChanged, Running: !stopping.Load(), Started: startedAt, Proxy: state.Proxy, Health: result, Fresh: !stopping.Load() && time.Since(result.Time) < time.Duration(cfg.Health.IntervalSeconds+cfg.Health.TimeoutSeconds+5)*time.Second, Targets: server.RecentTargets()})
+			_ = json.NewEncoder(writer).Encode(statusSnapshot{ConfigChanged: configChanged, Running: !stopping.Load(), Started: startedAt, Proxy: state.Proxy, Health: result, Latency: latency.Snapshot(), Fresh: !stopping.Load() && time.Since(result.Time) < time.Duration(cfg.Health.IntervalSeconds+cfg.Health.TimeoutSeconds+5)*time.Second, Targets: server.RecentTargets()})
 			return
 		}
 		if request.Method == http.MethodGet && request.URL.Path == "/probe" {
@@ -339,6 +340,11 @@ func backgroundWorker(path string) (resultErr error) {
 	logger.Info("后台代理已启动并接管系统代理", "监听地址", cfg.ListenAddress(), "进程", os.Getpid())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	latencyDone := make(chan struct{})
+	go func() {
+		defer close(latencyDone)
+		latency.Run(ctx, health.New(cfg, upstream, logger).Probe)
+	}()
 	healthDone := make(chan struct{})
 	go func() {
 		defer close(healthDone)
@@ -367,6 +373,7 @@ func backgroundWorker(path string) (resultErr error) {
 	}
 	cancel()
 	<-healthDone
+	<-latencyDone
 	logger.Info("后台代理准备停止并恢复设置")
 	return resultErr
 }

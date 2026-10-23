@@ -203,13 +203,20 @@ func (v *desktopView) paint() {
 	desktopRound(hdc, desktopRect{s(44), s(115), s(52), s(123)}, desktopScale(4, v.dpi), statusColor, statusColor)
 	text(v.panel.Subtitle, s(44), s(140), client.Right-s(88), s(18), v.labelFont, desktopTextSecondary)
 	desktopLine(hdc, s(44), s(171), client.Right-s(44), desktopBorder)
-	columnWidth := (client.Right - s(88)) / 3
-	for i, column := range []struct{ label, value, detail string }{{"本地入口", v.panel.Entry, "应用连接通过此入口"}, {"上游健康", v.panel.Health, v.panel.HealthDetail}, {"最近应用连接", v.panel.Target, v.panel.TargetDetail}} {
+	columnWidth := (client.Right - s(88)) / 4
+	for i, column := range []struct{ label, value, detail string }{{"本地入口", v.panel.Entry, "应用连接通过此入口"}, {"网络延迟", v.panel.Latency, v.panel.LatencyDetail}, {"上游健康", v.panel.Health, v.panel.HealthDetail}, {"最近应用连接", v.panel.Target, v.panel.TargetDetail}} {
 		x := s(44) + int32(i)*columnWidth
 		text(column.label, x, s(180), columnWidth-s(12), s(17), v.labelFont, desktopTextSecondary)
 		valueColor := desktopTextPrimary
-		if i == 1 && (strings.Contains(column.value, "过期") || strings.Contains(column.value, "未知")) {
+		if strings.Contains(column.value, "过期") || strings.Contains(column.value, "未知") {
 			valueColor = desktopWarning
+		}
+		if column.label == "网络延迟" {
+			if strings.Contains(column.value, "毫秒") {
+				valueColor = desktopSuccess
+			} else if column.value == "检测超时" || column.value == "连接异常" {
+				valueColor = desktopFailure
+			}
 		}
 		text(column.value, x, s(199), columnWidth-s(16), s(22), v.bodyFont, valueColor)
 		detail := column.detail

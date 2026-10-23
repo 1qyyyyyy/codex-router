@@ -127,6 +127,22 @@ func desktopText(hdc uintptr, font uintptr, text string, x, y, width, height int
 	desktopUser.NewProc("DrawTextW").Call(hdc, uintptr(unsafe.Pointer(desktopString(text))), ^uintptr(0), uintptr(unsafe.Pointer(&rect)), 0x0010)
 }
 
+// 从程序资源中按系统图标尺寸加载共享句柄，随进程释放。
+func desktopApplicationIcon(instance uintptr, small bool) uintptr {
+	widthMetric, heightMetric := uintptr(11), uintptr(12)
+	if small {
+		widthMetric, heightMetric = 49, 50
+	}
+	width := desktopCall("GetSystemMetrics", widthMetric)
+	height := desktopCall("GetSystemMetrics", heightMetric)
+	// 资源编号由图标资源编译工具为第一组图标分配。
+	icon := desktopCall("LoadImageW", instance, 1, 1, width, height, 0x8000)
+	if icon == 0 {
+		icon = desktopCall("LoadIconW", 0, 32512)
+	}
+	return icon
+}
+
 func runDesktop(path string) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -156,12 +172,12 @@ func runDesktop(path string) error {
 	}
 	desktopEnableDPI()
 	instance, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetModuleHandleW").Call(0)
-	class := desktopClass{Size: uint32(unsafe.Sizeof(desktopClass{})), Callback: syscall.NewCallback(desktopWindowProc), Instance: instance, Icon: desktopCall("LoadIconW", 0, 32512), Cursor: desktopCall("LoadCursorW", 0, 32512), Name: desktopString(name)}
+	class := desktopClass{Size: uint32(unsafe.Sizeof(desktopClass{})), Callback: syscall.NewCallback(desktopWindowProc), Instance: instance, Icon: desktopApplicationIcon(instance, false), SmallIcon: desktopApplicationIcon(instance, true), Cursor: desktopCall("LoadCursorW", 0, 32512), Name: desktopString(name)}
 	if desktopCall("RegisterClassExW", uintptr(unsafe.Pointer(&class))) == 0 {
 		return fmt.Errorf("无法注册原生面板窗口")
 	}
 	defer desktopCall("UnregisterClassW", uintptr(unsafe.Pointer(class.Name)), instance)
-	view := &desktopView{path: absolute, panel: desktopPanelState{Title: "正在读取后台状态", Subtitle: "正在确认本地入口和上游连接……", Entry: "正在读取", Health: "正在读取", Target: "正在读取"}}
+	view := &desktopView{path: absolute, panel: desktopPanelState{Title: "正在读取后台状态", Subtitle: "正在确认本地入口和上游连接……", Entry: "正在读取", Health: "正在读取", Latency: "正在读取", Target: "正在读取"}}
 	desktopCurrent = view
 	defer func() { desktopCurrent = nil }()
 	view.backgroundBrush, _, _ = desktopGDI.NewProc("CreateSolidBrush").Call(desktopBackground)
@@ -193,14 +209,14 @@ func runDesktop(path string) error {
 	view.detailButton = view.control("BUTTON", "查看详细记录", 0x5001000B, 112)
 	view.copyStatus = view.control("BUTTON", "复制状态", 0x5001000B, 116)
 	view.rebuildFonts(view.dpi)
-	view.tray = desktopNotify{Size: uint32(unsafe.Sizeof(desktopNotify{})), Window: window, ID: 1, Flags: 7, Callback: 0x8001, Icon: class.Icon}
+	view.tray = desktopNotify{Size: uint32(unsafe.Sizeof(desktopNotify{})), Window: window, ID: 1, Flags: 7, Callback: 0x8001, Icon: class.SmallIcon}
 	copy(view.tray.Tip[:], syscall.StringToUTF16("路由助手：后台状态与诊断"))
 	view.addTray()
 	view.openSettings()
 	view.setOutput("尚未运行诊断。\r\n点击右上角“运行诊断”，检查配置、上游连接和本地代理状态。")
 	view.updateControls()
 	desktopFitInitialWindow(view)
-	desktopCall("SetTimer", window, 1, 3000, 0)
+	desktopCall("SetTimer", window, 1, 1000, 0)
 	desktopCall("ShowWindow", window, 9)
 	desktopCall("ShowWindow", window, 9)
 	view.layout()
@@ -548,7 +564,7 @@ func (v *desktopView) action(id uintptr) {
 			text = v.diagnostic.Detail
 		}
 		if id == 116 {
-			text = fmt.Sprintf("%s\n%s\n本地入口：%s\n上游健康：%s\n%s\n最近应用连接：%s\n%s", v.panel.Title, v.panel.Subtitle, v.panel.Entry, v.panel.Health, v.panel.HealthDetail, v.panel.Target, v.panel.TargetDetail)
+			text = fmt.Sprintf("%s\n%s\n本地入口：%s\n网络延迟：%s\n%s\n上游健康：%s\n%s\n最近应用连接：%s\n%s", v.panel.Title, v.panel.Subtitle, v.panel.Entry, v.panel.Latency, v.panel.LatencyDetail, v.panel.Health, v.panel.HealthDetail, v.panel.Target, v.panel.TargetDetail)
 		}
 		if err := desktopCopyText(v.window, text); err != nil {
 			v.settingsNotice = err.Error()

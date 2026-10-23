@@ -3,6 +3,7 @@
 package main
 
 import (
+	"codex-router/health"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,8 @@ type desktopPanelState struct {
 	Entry          string
 	Health         string
 	HealthDetail   string
+	Latency        string
+	LatencyDetail  string
 	Target         string
 	TargetDetail   string
 	ConfigChanged  bool
@@ -27,7 +30,7 @@ type desktopPanelState struct {
 func readDesktopPanelState(path string) desktopPanelState {
 	statePath, backupPath := backgroundPaths(path)
 	_, backupErr := os.Stat(backupPath)
-	panel := desktopPanelState{RestorePending: backupErr == nil, Updated: time.Now()}
+	panel := desktopPanelState{RestorePending: backupErr == nil, Updated: time.Now(), Latency: "未监测", LatencyDetail: "启动后台后自动监测"}
 
 	state, err := readBackground(statePath)
 	if err != nil {
@@ -45,6 +48,7 @@ func readDesktopPanelState(path string) desktopPanelState {
 			return panel
 		}
 		panel.Title = "后台状态读取失败"
+		panel.Latency, panel.LatencyDetail = "未知", "无法确认后台状态"
 		panel.Subtitle = "无法读取后台状态文件"
 		panel.Entry = "状态未知"
 		panel.Health = "未知"
@@ -56,6 +60,7 @@ func readDesktopPanelState(path string) desktopPanelState {
 
 	var snap statusSnapshot
 	if err := fetchControl(state, "snapshot", &snap); err != nil {
+		panel.Latency, panel.LatencyDetail = "未知", "无法读取实时结果"
 		panel.Title = "后台状态读取失败"
 		panel.Subtitle = "无法读取后台实时状态"
 		panel.Entry = "状态未知"
@@ -69,7 +74,7 @@ func readDesktopPanelState(path string) desktopPanelState {
 }
 
 func panelStateFromSnapshot(snap statusSnapshot, now time.Time, restorePending bool) desktopPanelState {
-	panel := desktopPanelState{RestorePending: restorePending && !snap.Running, Updated: now, Entry: "尚未启动"}
+	panel := desktopPanelState{RestorePending: restorePending && !snap.Running, Updated: now, Entry: "尚未启动", Latency: "未监测", LatencyDetail: "后台正在停止"}
 	if !snap.Running {
 		panel.Title = "正在停止"
 		panel.Subtitle = "后台正在关闭并恢复系统代理"
@@ -82,6 +87,7 @@ func panelStateFromSnapshot(snap statusSnapshot, now time.Time, restorePending b
 	}
 
 	panel.Running = true
+	panel.Latency, panel.LatencyDetail = desktopLatencyText(snap.Latency, now)
 	panel.Title = "后台运行中"
 	panel.Subtitle = "正在等待真实应用连接"
 	panel.Entry = snap.Proxy
@@ -141,4 +147,21 @@ func compactHealthError(value string) string {
 		return string(runes[:30]) + "…"
 	}
 	return value
+}
+
+func desktopLatencyText(result health.Result, now time.Time) (string, string) {
+	if result.Time.IsZero() {
+		return "正在测量", "每 5 秒自动检测"
+	}
+	if result.Time.After(now) || now.Sub(result.Time) > health.LatencyMaxAge {
+		return "结果已过期", "等待新的延迟结果"
+	}
+	detail := result.Time.Format("15:04:05") + " · 每 5 秒"
+	if result.Status != "健康" || result.Error != "" || result.LatencyMS < 0 {
+		if result.Error == "延迟检测超时" {
+			return "检测超时", detail
+		}
+		return "连接异常", detail
+	}
+	return fmt.Sprintf("%d 毫秒", result.LatencyMS), detail
 }

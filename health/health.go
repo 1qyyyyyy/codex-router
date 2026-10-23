@@ -43,6 +43,15 @@ func New(cfg *config.Config, dial func(context.Context, string, string) (net.Con
 
 // Check 通过上游发起一次 HTTP 检测，且不会跟随重定向。
 func (c *Checker) Check(ctx context.Context) (result Result) {
+	return c.check(ctx, true)
+}
+
+// Probe 测量上游请求耗时，只返回结果，不覆盖周期健康状态文件。
+func (c *Checker) Probe(ctx context.Context) Result {
+	return c.check(ctx, false)
+}
+
+func (c *Checker) check(ctx context.Context, persist bool) (result Result) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -57,7 +66,7 @@ func (c *Checker) Check(ctx context.Context) (result Result) {
 			result.Error = "健康检测已取消"
 		}
 		result.LatencyMS = time.Since(started).Milliseconds()
-		if result.Status == "已取消" {
+		if result.Status == "已取消" || !persist {
 			return
 		}
 		if err := c.save(result); err != nil {

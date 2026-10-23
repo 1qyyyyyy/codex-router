@@ -25,6 +25,7 @@ type statusSnapshot struct {
 	Started       time.Time           `json:"启动时间"`
 	Proxy         string              `json:"本地入口"`
 	Health        health.Result       `json:"上游健康"`
+	Latency       health.Result       `json:"网络延迟"`
 	Fresh         bool                `json:"健康结果新鲜"`
 	Targets       []proxy.Observation `json:"最近应用目标"`
 }
